@@ -1,5 +1,5 @@
 [project]
-name = "embedservwrapper"
+name = "embedserv_wrapper"
 version = "1.0.0"
 description = "A wrapper for TPO-embedserv"
 readme = "README.md"
