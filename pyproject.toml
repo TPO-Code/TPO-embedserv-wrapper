@@ -1,8 +1,7 @@
 [project]
-name = "embedserv_wrapper"
+name = "EmbedservWrapper"
 version = "1.0.0"
 description = "A wrapper for TPO-embedserv"
-readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "requests"
