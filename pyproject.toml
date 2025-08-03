@@ -3,7 +3,6 @@ name = "embedserv_wrapper"
 version = "1.0.0"
 description = "A wrapper for TPO-embedserv"
 readme = "README.md"
-license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "requests"
