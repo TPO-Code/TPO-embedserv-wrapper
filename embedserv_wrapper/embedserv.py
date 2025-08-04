@@ -105,7 +105,7 @@ class EmbedServ:
 
     def check_server_status(self) -> bool:
         """
-        Checks if the EmbedServ server is running and reachable.
+        Checks if the EmbedServ server is running and reachable at its root URL.
 
         Returns:
             True if the server is running, False otherwise.
@@ -116,6 +116,43 @@ class EmbedServ:
             return True
         except requests.exceptions.RequestException:
             return False
+
+    def health_check(self) -> bool:
+        """
+        Pings the server's dedicated health check endpoint.
+
+        This is the recommended method for automated health checks (e.g., in Docker or Kubernetes).
+
+        Returns:
+            True if the server returns a healthy status (200 OK), False otherwise.
+        """
+        try:
+            # Note: The /health endpoint is not under /api/v1
+            response = self._session.get(f"{self.base_url}/health", timeout=3)
+            return response.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
+
+    def get_server_status(self) -> Dict[str, Any]:
+        """
+        Retrieves a detailed, live status report from the server.
+
+        Returns:
+            A dictionary containing information about the server's state,
+            such as the currently loaded model, device, and pending jobs.
+            Example:
+            {
+                "status": "running",
+                "current_model": "all-MiniLM-L6-v2",
+                "current_device": "cuda:0",
+                "last_used_at": "2023-10-27T10:05:30Z",
+                "keep_alive_seconds": 300.0,
+                "pending_queue_jobs": 0
+            }
+        """
+        return self._request("GET", "status")
+
+
 
     def list_remote_models(self) -> List[str]:
         """
@@ -216,19 +253,31 @@ class EmbedServ:
             A list of collection name strings.
         """
         response = self._request("GET", "db")
-        return response.get('collections', [])
+        collections_info = response.get('collections', [])
+        # Extract just the name from each dictionary
+        return [c['name'] for c in collections_info]
 
-    def create_collection(self, collection_name: str) -> None:
+    def create_collection(self, collection_name: str, model_name: str) -> None:
         """
-        Creates a new, empty collection on the server.
+        Creates a new, empty collection on the server and permanently
+        associates it with a specific embedding model.
+
+        This is a critical safeguard: once a collection is created with a model,
+        all subsequent add, query, or update operations for that collection
+        must use the same model.
 
         Args:
             collection_name: The name for the new collection.
+            model_name: The name of the model to associate with this collection
+                        (e.g., 'sentence-transformers/all-MiniLM-L6-v2').
 
         Raises:
             EmbedServError: If a collection with the same name already exists (409).
         """
-        self._request("POST", "db", json={"name": collection_name})
+        # The payload now includes both the name and the model
+        payload = {"name": collection_name, "model": model_name}
+        self._request("POST", "db", json=payload)
+
 
     def delete_collection(self, collection_name: str) -> None:
         """
@@ -241,6 +290,19 @@ class EmbedServ:
             EmbedServError: If the collection does not exist (404).
         """
         self._request("DELETE", f"db/{collection_name}")
+
+    def clear_collection(self, collection_name: str) -> None:
+        """
+        Deletes all documents from a collection but leaves the collection intact.
+
+        Args:
+            collection_name: The name of the collection to clear.
+
+        Raises:
+            EmbedServError: If the collection does not exist (404).
+        """
+        self._request("POST", f"db/{collection_name}/clear")
+
 
     def count_documents(self, collection_name: str) -> int:
         """
@@ -270,27 +332,36 @@ class EmbedServ:
         device: Optional[str] = None
     ) -> None:
         """
-        Adds documents to a collection. The server will generate embeddings for the items.
+        Adds documents to a collection. The server will generate embeddings.
 
         Args:
             collection_name: The name of the target collection.
             items: A single document string or a list of document strings.
-            model_name: The model to use for embedding the documents.
-            metadatas: An optional list of dictionaries, one for each document.
-            ids: An optional list of unique string IDs, one for each document.
-                 If not provided, UUIDs will be generated automatically.
+            model_name: The model to use for embedding the documents. Must match the
+                        collection's associated model.
+            metadatas: An optional list of non-empty metadata dictionaries.
+                       **Crucially, the server requires all metadata to be non-empty.**
+                       If this argument is omitted, the client will automatically
+                       provide a placeholder dictionary (`{'source': 'python-client'}`)
+                       for each item to satisfy this server requirement.
+            ids: An optional list of unique string IDs. If not provided, UUIDs are generated.
             device: The device to run the embedding model on (e.g., 'cpu', 'cuda').
 
         Raises:
             ValueError: If the number of items, ids, and metadatas do not match.
-            EmbedServError: If the collection does not exist (404).
+            EmbedServError: If the server returns an error.
         """
         if isinstance(items, str):
             items = [items]
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in items]
+
+            # --- FIX APPLIED HERE ---
+            # The original code generated [{}], which the server rejects.
+            # This now generates a valid, non-empty placeholder if no metadata is provided.
         if metadatas is None:
-            metadatas = [{} for _ in items]  # Default to empty metadata dict
+            metadatas = [{"source": "python-client"}] * len(items)
+
         if not (len(items) == len(ids) == len(metadatas)):
             raise ValueError("The number of items, ids, and metadatas must be the same.")
 
@@ -303,6 +374,46 @@ class EmbedServ:
         if device:
             payload["device"] = device
         self._request("POST", f"db/{collection_name}/add", json=payload)
+
+    def add_batch(
+            self,
+            collection_name: str,
+            model_name: str,  # <-- Add this required parameter
+            ids: List[str],
+            documents: List[str],
+            metadatas: List[Dict[str, Any]],
+            embeddings: List[List[float]],
+    ) -> None:
+        """
+        Adds a batch of documents with pre-computed embeddings to a collection.
+
+        This method is ideal for migrating an existing database, as it bypasses
+        on-the-fly embedding generation by the server.
+
+        Args:
+            collection_name: The name of the target collection.
+            model_name: The name of the model associated with the provided embeddings.
+                    This is required for server-side validation.
+            ids: A list of unique string IDs for each document.
+            documents: A list of document strings.
+            metadatas: A list of metadata dictionaries.
+            embeddings: A list of embedding vectors.
+
+        Raises:
+            ValueError: If the lengths of ids, documents, metadatas, and embeddings do not match.
+            EmbedServError: If the collection does not exist (404).
+        """
+        if not (len(ids) == len(documents) == len(metadatas) == len(embeddings)):
+            raise ValueError("The number of items in ids, documents, metadatas, and embeddings must be the same.")
+
+        payload = {
+            "model": model_name,
+            "ids": ids,
+            "documents": documents,
+            "metadatas": metadatas,
+            "embeddings": embeddings,
+        }
+        self._request("POST", f"db/{collection_name}/batch-add", json=payload)
 
     def query(
         self,
@@ -430,3 +541,32 @@ class EmbedServ:
         """
         payload = {"ids": ids}
         self._request("POST", f"db/{collection_name}/delete", json=payload)
+
+    def calculate_similarity(
+            self,
+            embeddings_a: List[List[float]],
+            embeddings_b: List[List[float]]
+    ) -> List[List[float]]:
+        """
+        Calculates cosine similarity between two sets of embeddings using the server.
+
+        This offloads the calculation to the server, removing the need for a local
+        NumPy or sentence-transformers dependency in the client application.
+
+        Args:
+            embeddings_a: The first list of embedding vectors.
+            embeddings_b: The second list of embedding vectors.
+
+        Returns:
+            A 2D list containing the cosine similarity scores between
+            each embedding in `embeddings_a` and `embeddings_b`.
+
+        Raises:
+            EmbedServError: If the server encounters an error during calculation.
+        """
+        payload = {
+            "embeddings_a": embeddings_a,
+            "embeddings_b": embeddings_b
+        }
+        response = self._request("POST", "similarity", json=payload)
+        return response.get('similarity_scores', [])
